@@ -1,5 +1,8 @@
 //! BlazeCursor: shake the mouse left/right quickly and the pointer grows so you can find it.
 //! Lives in the system tray; right-click the tray icon to quit.
+//!
+//! Fully event-driven: mouse movement arrives as raw input, and the animation timer only runs
+//! while the cursor is enlarged, so the app does no work at all while the mouse is still.
 #![windows_subsystem = "windows"]
 
 use std::collections::VecDeque;
@@ -15,22 +18,24 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::HiDpi::*;
+use windows_sys::Win32::UI::Input::*;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 // --- Tuning -----------------------------------------------------------------
-const ACTIVE_TICK_MS: i64 = 7; // update interval while the cursor is resizing (~144 Hz)
-const IDLE_TICK_MS: i64 = 12; // polling interval otherwise
+const ANIM_TICK_MS: i64 = 7; // update interval while the cursor is resizing (~144 Hz)
+const HOLD_TICK_MS: i64 = 50; // check interval while fully grown, waiting for the shake to end
 const WINDOW: Duration = Duration::from_millis(500); // reversals older than this are forgotten
 const REVERSALS_TO_START: usize = 4; // direction changes needed to trigger
 const MAX_SCALE: f32 = 4.0; // biggest cursor = base size * MAX_SCALE
-const FRAMES: usize = 32; // pre-rendered sizes between normal and max
+const FRAMES: usize = 32; // cursor sizes between normal and max
 const GROW_MS: f32 = 70.0; // easing time constant while growing
 const SHRINK_MS: f32 = 120.0; // easing time constant while shrinking
 
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_QUIT: usize = 1;
 const IDI_APP: PCWSTR = 1 as PCWSTR; // icon resource id, see assets/blazecursor.rc
+const MOUSE_MOVE_ABSOLUTE: u16 = 1; // RAWMOUSE.usFlags: tablets, remote desktop, VMs
 
 /// System cursors we enlarge, with their names under HKCU\Control Panel\Cursors.
 const CURSORS: [(u32, PCWSTR); 3] = [
@@ -65,20 +70,37 @@ fn main() {
 
         tray(hwnd, NIM_ADD);
 
+        // Mouse movement from every device, even though our window is never focused.
+        let mouse = RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: 0x02, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd };
+        RegisterRawInputDevices(&mouse, 1, size_of::<RAWINPUTDEVICE>() as u32);
+
         // A high-resolution waitable timer gives ~1 ms precision without changing the global
-        // timer resolution, so the resize animation can run well above SetTimer's ~64 Hz.
+        // timer resolution. It is only armed while the cursor is enlarged.
         let timer = CreateWaitableTimerExW(null(), null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        arm(timer, IDLE_TICK_MS);
+        let mut ticking = false;
 
         let mut shake = Shake::new();
         let mut msg: MSG = zeroed();
         'run: loop {
             if MsgWaitForMultipleObjects(1, &timer, 0, INFINITE, QS_ALLINPUT) == WAIT_OBJECT_0 {
-                arm(timer, shake.tick());
+                ticking = false;
+                if let Some(ms) = shake.tick() {
+                    arm(timer, ms);
+                    ticking = true;
+                }
             }
             while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
                 if msg.message == WM_QUIT {
                     break 'run;
+                }
+                if msg.message == WM_INPUT {
+                    if let Some(raw_dx) = raw_mouse_dx(msg.lParam) {
+                        shake.on_move(raw_dx);
+                        if shake.busy() && !ticking {
+                            arm(timer, 1);
+                            ticking = true;
+                        }
+                    }
                 }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -96,8 +118,23 @@ unsafe fn arm(timer: HANDLE, ms: i64) {
     SetWaitableTimer(timer, &due, 0, None, null(), 0);
 }
 
+/// Horizontal movement reported by a WM_INPUT mouse event (0 for absolute-position devices).
+unsafe fn raw_mouse_dx(lp: LPARAM) -> Option<i32> {
+    let mut raw: RAWINPUT = zeroed();
+    let mut size = size_of::<RAWINPUT>() as u32;
+    let header = size_of::<RAWINPUTHEADER>() as u32;
+    if GetRawInputData(lp as HRAWINPUT, RID_INPUT, (&mut raw as *mut RAWINPUT).cast(), &mut size, header) == u32::MAX
+        || raw.header.dwType != RIM_TYPEMOUSE
+    {
+        return None;
+    }
+    let m = raw.data.mouse;
+    Some(if m.usFlags as u16 & MOUSE_MOVE_ABSOLUTE != 0 { 0 } else { m.lLastX })
+}
+
 struct Shake {
-    frames: Vec<[HCURSOR; CURSORS.len()]>, // frames[i] = size for animation step i+1
+    base: i32,                             // normal cursor size in px
+    frames: Vec<[HCURSOR; CURSORS.len()]>, // frames[i] = step i+1, loaded on first use
     min_seg: i32,                          // px a stroke must travel to count as a reversal
     last_x: i32,
     dir: i32,
@@ -112,17 +149,11 @@ struct Shake {
 impl Shake {
     unsafe fn new() -> Self {
         let base = GetSystemMetrics(SM_CXCURSOR).max(32);
-        let frames = (1..=FRAMES)
-            .map(|i| {
-                let scale = 1.0 + (MAX_SCALE - 1.0) * i as f32 / FRAMES as f32;
-                let size = (base as f32 * scale).round() as i32;
-                CURSORS.map(|(ocr, name)| load_cursor(ocr, name, size))
-            })
-            .collect();
         let mut p = POINT { x: 0, y: 0 };
         GetCursorPos(&mut p);
         Shake {
-            frames,
+            base,
+            frames: vec![[null_mut(); CURSORS.len()]; FRAMES],
             min_seg: base * 5 / 4,
             last_x: p.x,
             dir: 0,
@@ -135,36 +166,53 @@ impl Shake {
         }
     }
 
-    /// Polls the cursor, advances the animation, and returns ms until the next tick.
-    unsafe fn tick(&mut self) -> i64 {
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_tick).as_secs_f32() * 1000.0;
-        self.last_tick = now;
+    /// True while the cursor is enlarged or about to be, i.e. while the timer is needed.
+    fn busy(&self) -> bool {
+        self.active || self.level > 0.0
+    }
 
-        // Count horizontal direction reversals of sufficiently long strokes.
+    /// Counts horizontal direction reversals of sufficiently long strokes.
+    unsafe fn on_move(&mut self, raw_dx: i32) {
+        let now = Instant::now();
         let mut p = POINT { x: 0, y: 0 };
-        if GetCursorPos(&mut p) != 0 {
-            let dx = p.x - self.last_x;
-            self.last_x = p.x;
-            if dx != 0 {
-                let d = dx.signum();
-                if d != self.dir {
-                    if self.run >= self.min_seg {
-                        self.reversals.push_back(now);
-                    }
-                    self.dir = d;
-                    self.run = 0;
-                }
-                self.run += dx.abs();
-            }
+        GetCursorPos(&mut p);
+        // Prefer on-screen movement; fall back to raw counts when the cursor is pinned at a
+        // screen edge so shakes there still register.
+        let dx = if p.x != self.last_x { p.x - self.last_x } else { raw_dx };
+        self.last_x = p.x;
+        if dx == 0 {
+            return;
         }
+        let d = dx.signum();
+        if d != self.dir {
+            if self.run >= self.min_seg {
+                self.reversals.push_back(now);
+                if !self.busy() {
+                    self.last_tick = now; // animation is about to (re)start
+                }
+                self.update_active(now);
+            }
+            self.dir = d;
+            self.run = 0;
+        }
+        self.run += dx.abs();
+    }
+
+    /// Start on a vigorous shake, stay big while the shake continues.
+    fn update_active(&mut self, now: Instant) {
         while self.reversals.front().is_some_and(|&t| now - t > WINDOW) {
             self.reversals.pop_front();
         }
-
-        // Start on a vigorous shake, stay big while the shake continues.
         let needed = if self.active { 1 } else { REVERSALS_TO_START };
         self.active = self.reversals.len() >= needed;
+    }
+
+    /// Advances the animation. Returns ms until the next tick, or None when back to idle.
+    unsafe fn tick(&mut self) -> Option<i64> {
+        let now = Instant::now();
+        let dt = (now - self.last_tick).as_secs_f32().min(0.05) * 1000.0;
+        self.last_tick = now;
+        self.update_active(now);
 
         // Exponential ease-out toward the target size, independent of tick jitter.
         let (target, tau) = if self.active { (1.0, GROW_MS) } else { (0.0, SHRINK_MS) };
@@ -178,15 +226,34 @@ impl Shake {
             self.shown = frame;
             if frame == 0 {
                 restore_cursors();
+                self.free_frames();
             } else {
-                for (i, &(ocr, _)) in CURSORS.iter().enumerate() {
+                let base = self.base;
+                let set = &mut self.frames[frame - 1];
+                if set[0].is_null() {
+                    let scale = 1.0 + (MAX_SCALE - 1.0) * frame as f32 / FRAMES as f32;
+                    let size = (base as f32 * scale).round() as i32;
+                    *set = CURSORS.map(|(ocr, name)| load_cursor(ocr, name, size));
+                }
+                for (&cursor, &(ocr, _)) in set.iter().zip(&CURSORS) {
                     // SetSystemCursor takes ownership, so hand it a copy.
-                    SetSystemCursor(CopyIcon(self.frames[frame - 1][i]), ocr);
+                    SetSystemCursor(CopyIcon(cursor), ocr);
                 }
             }
         }
 
-        if self.level == target { IDLE_TICK_MS } else { ACTIVE_TICK_MS }
+        match (self.active, self.level) {
+            (false, l) if l == 0.0 => None,
+            (true, l) if l == 1.0 => Some(HOLD_TICK_MS),
+            _ => Some(ANIM_TICK_MS),
+        }
+    }
+
+    unsafe fn free_frames(&mut self) {
+        for cursor in self.frames.iter_mut().flatten().filter(|c| !c.is_null()) {
+            DestroyCursor(*cursor);
+            *cursor = null_mut();
+        }
     }
 }
 

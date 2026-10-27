@@ -36,6 +36,24 @@ class ICONINFO(ctypes.Structure):
                 ("hbmMask", wt.HANDLE), ("hbmColor", wt.HANDLE)]
 
 
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wt.DWORD), ("dwFlags", wt.DWORD),
+                ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wt.DWORD), ("mi", MOUSEINPUT)]
+
+
+def move_to(x, y):
+    """Moves the cursor with real (injected) mouse input; BlazeCursor listens to raw input, which
+    SetCursorPos does not generate."""
+    vx, vy, vw, vh = (user32.GetSystemMetrics(n) for n in (76, 77, 78, 79))  # virtual desktop
+    mi = MOUSEINPUT(dx=round((x - vx) * 65535 / (vw - 1)), dy=round((y - vy) * 65535 / (vh - 1)),
+                    dwFlags=0x0001 | 0x8000 | 0x4000)  # MOVE | ABSOLUTE | VIRTUALDESK
+    user32.SendInput(1, ctypes.byref(INPUT(type=0, mi=mi)), ctypes.sizeof(INPUT))
+
+
 user32.CopyIcon.restype = wt.HANDLE
 for f, r in [("GetDC", wt.HANDLE), ("CreateCompatibleDC", wt.HANDLE), ("CreateCompatibleBitmap", wt.HANDLE),
              ("SelectObject", wt.HANDLE)]:
@@ -125,7 +143,7 @@ def main(scene):
         for dur, fn in timeline:
             while (t := time.perf_counter() - t0) < dur:
                 x, y = fn(t / dur)
-                user32.SetCursorPos(int(x), int(y))
+                move_to(x, y)
                 if time.perf_counter() >= nxt:
                     frames.append(grab(x0, y0))
                     nxt += 1 / FPS
