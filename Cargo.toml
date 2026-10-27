@@ -1,0 +1,31 @@
+[package]
+name = "blazecursor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shake your mouse to find your cursor on Windows"
+
+[build-dependencies]
+embed-resource = "3"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
